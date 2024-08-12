@@ -26,15 +26,16 @@ import cProfile
 import pstats
 from functools import partial
 import re
-
-import deaminate
+from lxml import etree
+import io
+import mmap
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-# Check that necessary executables are loaded and in the path
+# Check that necessary executables are loaded and in the path; this avoids getting too far into the run before a needless error
 def check_executables():
     required = ['makeblastdb', 'blastn', 'convert2blastmask']
     missing = [cmd for cmd in required if shutil.which(cmd) is None]
@@ -61,7 +62,7 @@ def change_extension(file_path: str, new_extension: str) -> str:
 
 
 # How to handle ambigous IUPAC DNA nucleotide codes
-# this was never implemented, but I try to implement in future updates
+# this was never implemented, but I'll try to implement in future updates
 iupac_codes = {
     'A': 'A', 'C': 'C', 'G': 'G', 'T': 'T',
     'R': 'AG', 'Y': 'CT', 'S': 'GC', 'W': 'AT', 'K': 'GT', 'M': 'AC',
@@ -79,7 +80,7 @@ ambig_iupac = {i + j: get_iupac_intersection(i, j)
                for i in iupac_codes for j in iupac_codes}
 
 
-# checks for duplicated headers in the sequence reads
+# checks for duplicated headers in the sequence reads; right now it warns of duplicates 
 def validate_read_ids(records: str) -> bool:
     """
     Check for duplicated headers in the sequence reads.
@@ -108,7 +109,7 @@ def validate_read_ids(records: str) -> bool:
         logger.error(f"File permissions: {oct(os.stat(records).st_mode)[-3:]}" if os.path.exists(records) else "N/A")
         return False
 
-# **** the new rewrite of conversion as a C extension is not working well. Adding back in the functions that use the new C implimentation of fastools ****
+# **** the new rewrite of conversion as a C extension is not working well. Adding back in the functions that use the new C implimentation of fastools from Riva ****
 # rewrote process_strands and deaminate functions as C extensions; imported at begining
 # def process_strand(source, strand):
 #     return deaminate.deaminate(source, strand)
@@ -181,6 +182,8 @@ def process_strand(args: Tuple[str, str]) -> List[SeqIO.SeqRecord]:
     
     return seqs
 
+# added parallel processing so that a and b strands are done in parallel
+# could still update to process the refs and seqs in parallel as well
 def deaminate(source: str, strand: str = 'ab') -> None:
     """
     Deaminate sequences using faconvert.
@@ -202,7 +205,7 @@ def deaminate(source: str, strand: str = 'ab') -> None:
         logger.error(f"Error writing to file {output_file}: {e}")
         raise
 
-
+# Performs alignment using blastn, outputs alignments in blast xml format
 def run_blast(query: str, subject: str, xml_output: str, mask: bool = False, num_threads: int = 8) -> None:
     """
     Run BLAST alignment with optional masking.
@@ -297,9 +300,10 @@ class BlastHit:
     subject_sequence: str
     query_sequence: str
 
+# Rewrote parse functions to use lxml C libraries in python for speed improvements
 def parse_blast_xml(file_path: str, e_value_threshold: float = 0.1) -> Iterator[BlastHit]:
     """
-    Parse BLAST XML output file and yield high-quality hits.
+    Parse BLAST XML output file using lxml and yield high-quality hits.
     
     Parameters:
         file_path: Path to the BLAST XML file
@@ -309,46 +313,101 @@ def parse_blast_xml(file_path: str, e_value_threshold: float = 0.1) -> Iterator[
         BlastHit objects for qualifying alignments
     """
     try:
-        with open(file_path, 'r') as xml_file:
-            for record in NCBIXML.parse(xml_file):
-                if not record.alignments:
-                    continue
+        # Precompile xpath expressions
+        query_id_xpath = etree.XPath("Iteration_query-def/text()")
+        hit_xpath = etree.XPath("Iteration_hits/Hit")
+        hsp_xpath = etree.XPath("Hit_hsps/Hsp")
+        
+        # Use lxml to stream through the XML file
+        context = etree.iterparse(file_path, events=('end',), tag='Iteration')
 
-                # Get all HSPs and their E-values
-                all_hsps = [
-                    (alignment.hsps[0].expect, i, alignment)
-                    for i, alignment in enumerate(record.alignments)
-                    if alignment.hsps
-                ]
+        for event, elem in context:
+            query_id = query_id_xpath(elem)[0].split()[0]
+            
+            best_e_value = float('inf')
+            
+            for hit in hit_xpath(elem):
+                accession = hit.find('Hit_accession').text
+                
+                for hsp in hsp_xpath(hit):
+                    e_value = float(hsp.find('Hsp_evalue').text)
+                    
+                    if e_value < best_e_value:
+                        best_e_value = e_value
+                    
+                    if e_value <= best_e_value * (1 / e_value_threshold):
+                        yield BlastHit(
+                            subject_accession=accession,
+                            query_id=query_id,
+                            expect_value=e_value,
+                            subject_start=int(hsp.find('Hsp_hit-from').text),
+                            subject_end=int(hsp.find('Hsp_hit-to').text),
+                            query_start=int(hsp.find('Hsp_query-from').text),
+                            query_end=int(hsp.find('Hsp_query-to').text),
+                            subject_sequence=hsp.find('Hsp_hseq').text,
+                            query_sequence=hsp.find('Hsp_qseq').text
+                        )
 
-                if not all_hsps:
-                    continue
+            # Clear the element and its ancestors from memory
+            elem.clear()
+            while elem.getprevious() is not None:
+                del elem.getparent()[0]
 
-                # Sort by E-value and get the best E-value
-                all_hsps.sort(key=lambda x: x[0])
-                best_e_value = all_hsps[0][0]
+        # Cleanup
+        del context
 
-                for e_value, _, alignment in all_hsps:
-                    if e_value > best_e_value * (1 / e_value_threshold):
-                        break
-
-                    hsp = alignment.hsps[0]
-                    yield BlastHit(
-                        subject_accession=alignment.accession,
-                        query_id=record.query.split()[0],
-                        expect_value=hsp.expect,
-                        subject_start=hsp.sbjct_start,
-                        subject_end=hsp.sbjct_end,
-                        query_start=hsp.query_start,
-                        query_end=hsp.query_end,
-                        subject_sequence=hsp.sbjct,
-                        query_sequence=hsp.query
-                    )
     except IOError as e:
         logger.error(f"Error reading BLAST XML file {file_path}: {e}")
         raise
+    except etree.XMLSyntaxError as e:
+        logger.error(f"XML Syntax Error in BLAST XML file {file_path}: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error while parsing BLAST XML file {file_path}: {e}")
+        raise
 
 
+    # try:
+    #     with open(file_path, 'r') as xml_file:
+    #         for record in NCBIXML.parse(xml_file):
+    #             if not record.alignments:
+    #                 continue
+
+    #             # Get all HSPs and their E-values
+    #             all_hsps = [
+    #                 (alignment.hsps[0].expect, i, alignment)
+    #                 for i, alignment in enumerate(record.alignments)
+    #                 if alignment.hsps
+    #             ]
+
+    #             if not all_hsps:
+    #                 continue
+
+    #             # Sort by E-value and get the best E-value
+    #             all_hsps.sort(key=lambda x: x[0])
+    #             best_e_value = all_hsps[0][0]
+
+    #             for e_value, _, alignment in all_hsps:
+    #                 if e_value > best_e_value * (1 / e_value_threshold):
+    #                     break
+
+    #                 hsp = alignment.hsps[0]
+    #                 yield BlastHit(
+    #                     subject_accession=alignment.accession,
+    #                     query_id=record.query.split()[0],
+    #                     expect_value=hsp.expect,
+    #                     subject_start=hsp.sbjct_start,
+    #                     subject_end=hsp.sbjct_end,
+    #                     query_start=hsp.query_start,
+    #                     query_end=hsp.query_end,
+    #                     subject_sequence=hsp.sbjct,
+    #                     query_sequence=hsp.query
+    #                 )
+    # except IOError as e:
+    #     logger.error(f"Error reading BLAST XML file {file_path}: {e}")
+    #     raise
+
+# changes methylation status back to original sequence to determine methylation per read
 def reaminate(ref_seq: str, query_seq: str, conv_ref: str, conv_query: str) -> Seq:
     """
     Reconstruct methylation status of query sequence based on alignment with reference.
@@ -407,7 +466,12 @@ def reaminate(ref_seq: str, query_seq: str, conv_ref: str, conv_query: str) -> S
 '''reconstructed_seq = reaminate(reference_sequence, query_sequence, converted_reference, converted_query)
 print(reconstructed_seq)'''
 
+# Stores commonly used files in memory to reduce IO operations
+def memory_map_file(filename):
+    with open(filename, 'rb') as f:
+        return mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
 
+# primary function of bsAlign; calls all other functions
 def put_data(seqs: str, refs: str, dest: str, mask: bool = False, strand: str = 'ab', update: bool = False, batch_size: int = 5000):
     """
     Process sequence alignments and store results in an SQLite database.
@@ -419,6 +483,7 @@ def put_data(seqs: str, refs: str, dest: str, mask: bool = False, strand: str = 
         mask: Whether to use masking in BLAST
         strand: Strand(s) to process ('a', 'b', or 'ab')
         update: Whether to update an existing database
+        batch_size: Number of records to process in each batch
     """
     temp_index = tempfile.mktemp(dir=os.environ['HOME'])
 
@@ -446,7 +511,6 @@ def put_data(seqs: str, refs: str, dest: str, mask: bool = False, strand: str = 
         start_time = time.time()
         deaminate(seqs, strand)
         deaminate(refs)
-        
         logger.info(f'Conversion completed in {time.time() - start_time:.2f} seconds')
 
         logger.info('Aligning...')
@@ -458,17 +522,22 @@ def put_data(seqs: str, refs: str, dest: str, mask: bool = False, strand: str = 
 
     logger.info('Filing data...')
     
-    
     # Create sequence index
     try:
         seqs_index = SeqIO.index_db(temp_index, [seqs, refs], 'fasta')
     except Exception as e:
         logger.error(f"Error creating sequence index: {e}")
         return
+    
+    seqs_mmap = memory_map_file(seqs)
+    refs_mmap = memory_map_file(refs)
 
     # Set up SQLite database
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(':memory:')
+        conn.execute("PRAGMA journal_mode=MEMORY")
+        conn.execute("PRAGMA synchronous=OFF")
+        conn.execute("PRAGMA cache_size=-2000000")
         setup_database(conn)
     except sqlite3.Error as e:
         logger.error(f"Error setting up SQLite database: {e}")
@@ -476,11 +545,10 @@ def put_data(seqs: str, refs: str, dest: str, mask: bool = False, strand: str = 
 
     # Process BLAST results
     try:
-        records_to_insert = []
-        records_to_update = []
+        records_to_upsert = []
         parse_start = time.time()
+        
         for hit in parse_blast_xml(xml_path):
-            start_time = time.time()
             query_parts = hit.query_id.split('.')
             subject_parts = hit.subject_accession.split('.')
             query_strand, subject_strand = query_parts[-1], subject_parts[-1]
@@ -502,16 +570,14 @@ def put_data(seqs: str, refs: str, dest: str, mask: bool = False, strand: str = 
             if subject_strand == 'b':
                 subject_seq_obj = subject_seq_obj.reverse_complement()
             
-             # Reconstruct methylation status
+            # Reconstruct methylation status
             try:
-                # reaminate_start = time.time()
                 reconstructed_seq = reaminate(
                     str(subject_seq_obj.seq[hit.subject_start - 1:hit.subject_end]).upper(),
                     str(query_seq_obj.seq[hit.query_start - 1:hit.query_end]).upper(),
                     hit.subject_sequence,
                     hit.query_sequence
                 )
-                # logger.info(f"reAminate time: {time.time() - reaminate_start:.2f} seconds")
             except AssertionError as e:
                 logger.error(f"Assertion error in reaminate: {e}. Skipping this alignment.")
                 continue
@@ -526,59 +592,70 @@ def put_data(seqs: str, refs: str, dest: str, mask: bool = False, strand: str = 
             # Prepare record
             query_id, experiment = (query_id.split('|') + [''])[:2]
             record = (query_id, experiment, subject_id, hit.expect_value, subject_strand, padded_seq.upper())
-                        
-            if update:
-                records_to_update.append(record)
-            else:
-                records_to_insert.append(record)
+            records_to_upsert.append(record)
 
-            # Bulk insert or update when batch size is reached
-            if len(records_to_insert) >= batch_size or len(records_to_update) >= batch_size:
-               logger.info(f"Time spent processing before insertion: {time.time() - start_time:.2f} seconds")
-               if update:
-                   insert_start = time.time()
-                   bulk_update_records(conn, records_to_update, batch_size=batch_size)
-                   logger.info(f"Actual insertion time: {time.time() - insert_start:.2f} seconds")
-                   records_to_update = []
-               else:
-                   insert_start = time.time()
-                   bulk_insert_sequences(conn, records_to_insert, batch_size=batch_size)
-                   records_to_insert = []
-                   logger.info(f"Total time for this batch: {time.time() - insert_start:.2f} seconds")
-                   logger.info(f"Parse blast xml time: {time.time() - parse_start:.2f} seconds")
+            # Bulk upsert when batch size is reached
+            if len(records_to_upsert) >= batch_size:
+                bulk_upsert_sequences(conn, records_to_upsert, batch_size=batch_size)
+                records_to_upsert = []
 
-        # Insert or update remaining records
-        if update:
-            bulk_update_records(conn, records_to_update, batch_size=batch_size)
-        else:
-            bulk_insert_sequences(conn, records_to_insert, batch_size=batch_size)
+        # Upsert any remaining records
+        if records_to_upsert:
+            bulk_upsert_sequences(conn, records_to_upsert, batch_size=batch_size)
 
-    except Exception as e:
-        logger.error(f"Error processing BLAST results: {e}")
-    finally:
         # Add references to database
         add_references_to_db(conn, seqs_index)
 
         logger.info(f'Data filing completed in {time.time() - parse_start:.2f} seconds')
         print_alignment_stats(conn)
 
-        conn.commit()
+    except Exception as e:
+        logger.error(f"Error processing BLAST results: {e}")
+    finally:
+        try:
+            # After processing, save the in-memory database to disk
+            logger.info("Saving in-memory database to disk...")
+            disk_conn = sqlite3.connect(db_path)
+            conn.backup(disk_conn)
+            disk_conn.close()
+            logger.info("Database saved to disk successfully.")
+        except sqlite3.Error as e:
+            logger.error(f"Error saving database to disk: {e}")
+
+        # Clean up
         conn.close()
-        os.remove(temp_index)
+        seqs_mmap.close()
+        refs_mmap.close()
+
+        try:
+            os.remove(temp_index)
+        except OSError as e:
+            logger.error(f"Error removing temporary index file: {e}")
+        
 
 def setup_database(conn: sqlite3.Connection):
     """Set up the SQLite database schema"""
     try:
         cursor = conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS records 
-                        (id INTEGER PRIMARY KEY NOT NULL, 
-                        read TEXT, expt TEXT, locus TEXT, 
-                        expect REAL, strand TEXT, sequence TEXT)''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS loci 
-                        (id INTEGER PRIMARY KEY NOT NULL, locus TEXT, sequence TEXT)''')
-        cursor.execute('CREATE INDEX IF NOT EXISTS loc_idx ON loci (locus)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS els_idx ON records (expt, locus, strand)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS rls_idx ON records (read, locus, strand)')
+        cursor.executescript('''
+            CREATE TABLE IF NOT EXISTS records (
+                id INTEGER PRIMARY KEY NOT NULL, 
+                read TEXT UNIQUE, 
+                expt TEXT, 
+                locus TEXT, 
+                expect REAL, 
+                strand TEXT, 
+                sequence TEXT
+            );
+            CREATE TABLE IF NOT EXISTS loci (
+                id INTEGER PRIMARY KEY NOT NULL, 
+                locus TEXT UNIQUE, 
+                sequence TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_records_read ON records(read);
+            CREATE INDEX IF NOT EXISTS idx_records_locus_strand_expt ON records(locus, strand, expt);
+            CREATE INDEX IF NOT EXISTS idx_loci_locus ON loci(locus);
+        ''')
         conn.commit()
     except sqlite3.Error as e:
         logger.error(f"Error setting up SQLite database schema: {e}")
@@ -586,75 +663,63 @@ def setup_database(conn: sqlite3.Connection):
         raise
 
 
-def bulk_insert_sequences(conn: sqlite3.Connection, records: List[Tuple], batch_size: int = 1000):
-    """Insert multiple sequence records into the database."""
+def bulk_upsert_sequences(conn: sqlite3.Connection, records: List[Tuple], batch_size: int = 10000):
+    cursor = conn.cursor()
+    start_time = time.time()
+    total_records = len(records)
+    
     try:
-        cursor = conn.cursor()
-        start_time = time.time()
-        total_records = len(records)
-        
         cursor.execute('BEGIN TRANSACTION')
-        for i in range(0, total_records, batch_size):
-            batch = records[i:i+batch_size]
-            cursor.executemany('''
-                INSERT INTO records (read, expt, locus, expect, strand, sequence)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', batch)
-        cursor.execute('COMMIT')
         
-        end_time = time.time()
-        duration = end_time - start_time
-        logger.info(f"Successfully inserted {total_records} records in {duration:.2f} seconds")
-        logger.info(f"Average insertion rate: {total_records / duration:.2f} records/second")
-        logger.info(f"Batch size used: {batch_size}")
+        sql = '''
+        INSERT OR REPLACE INTO records (read, expt, locus, expect, strand, sequence)
+        VALUES (?, ?, ?, ?, ?, ?)
+        '''
+        
+        cursor.executemany(sql, records)
+        
+        conn.commit()
+        
     except sqlite3.Error as e:
-        logger.error(f"Error inserting records: {e}")
+        logger.error(f"Error upserting records: {e}")
         conn.rollback()
         raise
+    finally:
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info(f"Successfully upserted {total_records} records in {duration:.2f} seconds")
+        logger.info(f"Average upsert rate: {total_records / duration:.2f} records/second")
+
 
 def add_references_to_db(conn: sqlite3.Connection, seqs_index: Dict[str, SeqIO.SeqRecord]):
     """Add new reference sequences to the database."""
     try:
         cursor = conn.cursor()
         
-        # Get existing loci
-        cursor.execute('SELECT locus FROM loci')
-        existing_loci = set(row[0] for row in cursor.fetchall())
+        logger.info("Adding new reference sequences to the database")
         
-        # Get new loci
-        cursor.execute('SELECT DISTINCT locus FROM records')
-        all_loci = set(row[0] for row in cursor.fetchall())
-        new_loci = all_loci - existing_loci
+        cursor.execute('BEGIN TRANSACTION')
         
-        logger.info(f"Adding {len(new_loci)} new reference sequences to the database")
+        sql = '''
+        INSERT OR REPLACE INTO loci (locus, sequence)
+        VALUES (?, ?)
+        '''
         
-        new_references = []
-        for locus in new_loci:
-            if locus not in seqs_index:
-                logger.warning(f"Locus {locus} not found in seqs_index, skipping")
-                continue
-            
-            seq_record = seqs_index[locus]
-            sequence_str = str(seq_record.seq)
-            new_references.append((seq_record.id, sequence_str))
+        new_references = [(seq_record.id, str(seq_record.seq)) for seq_record in seqs_index.values()]
         
-        cursor.executemany("INSERT INTO loci (locus, sequence) VALUES (?, ?)", new_references)
+        cursor.executemany(sql, new_references)
+        
         conn.commit()
-        logger.info("Successfully added reference sequences to the database")
+        logger.info(f"Successfully added {len(new_references)} reference sequences to the database")
         
     except sqlite3.Error as e:
         logger.error(f"Error adding references to database: {e}")
-        conn.rollback()
-        raise
-    except KeyError as e:
-        logger.error(f"KeyError when accessing seqs_index: {e}")
         conn.rollback()
         raise
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         conn.rollback()
         raise
-
 
 # rewrote for adding records in bulk instead of one at a time. This should save a huge amount of time!
 def bulk_update_records(conn: sqlite3.Connection, records: List[Tuple], batch_size: int = 1000):
@@ -674,14 +739,16 @@ def bulk_update_records(conn: sqlite3.Connection, records: List[Tuple], batch_si
             ''', batch)
         cursor.execute('COMMIT')
         
-        end_time = time.time()
-        duration = end_time - start_time
-        logger.info(f"Successfully updated {total_records} records in {duration:.2f} seconds")
-        logger.info(f"Average update rate: {total_records / duration:.2f} records/second")
     except sqlite3.Error as e:
         logger.error(f"Error updating records: {e}")
         conn.rollback()
         raise
+
+    finally:
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info(f"Successfully updated {total_records} records in {duration:.2f} seconds")
+        logger.info(f"Average update rate: {total_records / duration:.2f} records/second")
 
 
 def print_alignment_stats(conn: sqlite3.Connection):
@@ -765,8 +832,16 @@ def main() -> None:
 
     try:
         start_time = time.time()
+        pr = cProfile.Profile()
+        pr.enable()
         put_data(args.seqs, args.refs, args.Save, args.mask, args.strand, args.update, args.batch_size)
         logger.info(f"R1 processing finished in {time.time() - start_time:.2f} seconds")
+        pr.disable()
+        s = io.StringIO()
+        sortby = pstats.SortKey.TIME
+        ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
+        ps.print_stats(30)
+        print(s.getvalue())
         if args.pair:
             pair_time = time.time()
             paired_strand = {'a': 'b', 'b': 'a', 'ab': 'ab'}[args.strand]
