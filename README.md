@@ -1,2 +1,2 @@
 # reAminator_reNewed
-Updated version of the original reAminator by Russ Darst
+A complete rewrite of the original reAminator code, first implemented by Russel Darst.
